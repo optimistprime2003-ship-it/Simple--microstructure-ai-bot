@@ -1,77 +1,65 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import ccxt
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from datetime import datetime
 
-# --- APP CONFIG & UI ---
-st.set_page_config(page_title="AlphaFlow Microstructure", layout="wide")
-st.title("🏹 AlphaFlow: Order Flow & Divergence Lab")
+# --- APP CONFIG ---
+st.set_page_config(page_title="AlphaFlow Live", layout="wide")
+st.title("⚡ AlphaFlow: Live WebSocket Order Flow")
 
-# --- ENGINE: SYNTHETIC DATA & LOGIC ---
-def get_market_data(n_ticks=500):
-    price = 100.0
-    data = []
-    for _ in range(n_ticks):
-        side = np.random.choice(['Buy', 'Sell'])
-        volume = np.random.randint(5, 150)
-        # Random walk price with momentum weight
-        price += np.random.normal(0, 0.05) if side == 'Buy' else -np.random.normal(0, 0.05)
-        data.append({"Price": round(price, 2), "Side": side, "Volume": volume})
-    return pd.DataFrame(data)
+# --- LIVE DATA CONNECTION ---
+# We use CCXT to connect to the global exchange ledger
+exchange = ccxt.binance()
 
-df = get_market_data()
-df['Delta'] = df.apply(lambda x: x['Volume'] if x['Side'] == 'Buy' else -x['Volume'], axis=1)
-df['CVD'] = df['Delta'].cumsum()
+def get_live_data(symbol='BTC/USDT'):
+    try:
+        # Fetch the most recent 500 market trades (The 'Tape')
+        trades = exchange.fetch_trades(symbol, limit=500)
+        df = pd.DataFrame(trades, columns=['price', 'amount', 'side', 'timestamp'])
+        
+        # Microstructure Logic: Delta = Market Buy Volume - Market Sell Volume
+        df['Delta'] = df.apply(lambda x: x['amount'] if x['side'] == 'buy' else -x['amount'], axis=1)
+        df['CVD'] = df['Delta'].cumsum()
+        return df
+    except Exception as e:
+        st.error(f"Connection Error: {e}")
+        return pd.DataFrame()
 
-# --- ALERT LOGIC: DIVERGENCE DETECTION ---
-def detect_alerts(df):
-    recent = df.tail(20)
-    price_trend = recent['Price'].iloc[-1] > recent['Price'].iloc[0]
-    delta_trend = recent['CVD'].iloc[-1] > recent['CVD'].iloc[0]
-    
-    # Bearish Divergence: Price Up, Delta Down (Exhaustion)
-    if price_trend and not delta_trend:
-        return "⚠️ BEARISH DIVERGENCE: Price rising but buying pressure is fading. Possible Exhaustion."
-    # Bullish Divergence: Price Down, Delta Up (Absorption)
-    if not price_trend and delta_trend:
-        return "✅ BULLISH DIVERGENCE: Price falling but selling pressure is decreasing. Possible Absorption."
-    return None
+# Auto-refresh the live data
+df = get_live_data()
 
-alert = detect_alerts(df)
-if alert:
-    st.warning(alert)
-    st.toast(alert) # Pop-up notification in-app
+# --- THE "ONE-CLICK" INSTITUTIONAL WALL FEATURE ---
+st.sidebar.header("🎯 Pro Tools")
+if st.sidebar.button("🔍 Find Institutional Wall"):
+    # Scans for the price level with the highest concentrated volume (Absorption)
+    wall_level = df.groupby('price')['amount'].sum().idxmax()
+    wall_vol = df.groupby('price')['amount'].sum().max()
+    st.sidebar.success(f"Wall Detected at: ${wall_level}")
+    st.sidebar.info(f"Total Absorption: {round(wall_vol, 4)} BTC")
+    st.toast(f"Major Institutional Wall found at ${wall_level}!")
 
-# --- DASHBOARD LAYOUT ---
+# --- UI LAYOUT ---
 col1, col2 = st.columns([1, 2])
 
 with col1:
-    st.subheader("🛡️ Absorption Detector")
-    footprint = df.groupby(['Price', 'Side'])['Volume'].sum().unstack(fill_value=0)
-    footprint['Total_Volume'] = footprint.get('Buy', 0) + footprint.get('Sell', 0)
-    
-    # Highlight high-volume nodes (Potential Icebergs)
-    icebergs = footprint[footprint['Total_Volume'] > footprint['Total_Volume'].mean() * 2]
-    st.write("Identified Institutional Absorption Zones:")
-    st.dataframe(icebergs[['Total_Volume']])
+    st.subheader("👣 Live Footprint Concentration")
+    # Grouping volume by price to visualize the 'Footprint' density
+    footprint = df.groupby('price')['amount'].sum().sort_index(ascending=False).head(15)
+    st.bar_chart(footprint)
+    st.caption("Higher bars = Significant Absorption/Iceberg Zones")
 
 with col2:
-    st.subheader("📈 Delta vs. Price Analysis")
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(y=df['Price'], name="Price", line=dict(color='#00f2ff')), secondary_y=False)
-    fig.add_trace(go.Bar(y=df['CVD'], name="CVD", marker_color='white', opacity=0.2), secondary_y=True)
-    fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0, r=0, t=0, b=0))
+    st.subheader("📈 Cumulative Delta (Conviction)")
+    fig = go.Figure()
+    # CVD shows the net aggression of the buyers vs sellers[cite: 1, 2]
+    fig.add_trace(go.Scatter(x=df.index, y=df['CVD'], fill='tozeroy', 
+                             line=dict(color='#00ff88'), name="CVD"))
+    fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0,r=0,t=0,b=0))
     st.plotly_chart(fig, use_container_width=True)
 
-# --- FOOTPRINT HEATMAP ---
-st.subheader("👣 Footprint Heatmap")
-
-fp_fig = go.Figure(data=go.Heatmap(
-    z=footprint['Total_Volume'],
-    y=footprint.index,
-    x=['Sells (Bid)', 'Buys (Ask)'],
-    colorscale='Hot'
-))
-fp_fig.update_layout(template="plotly_dark", height=500)
-st.plotly_chart(fp_fig, use_container_width=True)
+# --- REAL-TIME ALERTS ---
+st.divider()
+last_delta = df['Delta'].iloc[-1]
+if abs(last_delta) > df['Delta'].mean() * 3:
+    st.warning(f"🚨 LARGE ORDER DETECTED: {'Buy' if last_delta > 0 else 'Sell'} of {abs(round(last_delta, 2))} BTC")
